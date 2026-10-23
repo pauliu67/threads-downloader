@@ -1,0 +1,4 @@
+flask>=3.0
+requests>=2.31
+playwright>=1.45
+gunicorn>=22.0
