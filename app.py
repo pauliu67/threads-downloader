@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Threads 影片下載 Web 服務
+Threads 影片／圖片下載 Web 服務
 
 啟動：
     pip install -r requirements.txt
@@ -15,8 +15,7 @@ from urllib.parse import urlparse, quote
 import requests
 from flask import Flask, Response, jsonify, request, abort
 
-from threads_dl import (HEADERS, POST_RE, extract_static, extract_browser,
-                        post_code)
+from threads_dl import HEADERS, extract, filenames, find_threads_url
 
 app = Flask(__name__)
 
@@ -50,35 +49,26 @@ def is_allowed_cdn(u: str) -> bool:
 
 @app.post("/api/extract")
 def api_extract():
-    url = (request.get_json(silent=True) or {}).get("url", "").strip()
-    if not POST_RE.search(url):
-        return jsonify(error="這不是有效的 Threads 貼文連結"), 400
+    raw = (request.get_json(silent=True) or {}).get("url", "")
+    url = find_threads_url(raw)
+    if not url:
+        return jsonify(error="找不到 Threads 連結，請貼上貼文或分享連結"), 400
 
-    videos = []
-    try:
-        videos = extract_static(url)
-    except requests.RequestException:
-        pass
-    if not videos:
-        try:
-            videos = extract_browser(url)
-        except Exception:
-            videos = []
+    code, media = extract(url)
+    media = [m for m in media if is_allowed_cdn(m["url"])]
+    if not media:
+        return jsonify(error="找不到影片或圖片（可能是純文字、私人帳號或需要登入）"), 404
 
-    videos = [v for v in videos if is_allowed_cdn(v)]
-    if not videos:
-        return jsonify(error="找不到影片（可能是純圖文、私人帳號或需要登入）"), 404
-
-    code = post_code(url)
     items = []
-    for i, v in enumerate(videos, 1):
-        name = f"{code}_{i}.mp4" if len(videos) > 1 else f"{code}.mp4"
+    for m, name in zip(media, filenames(code, media)):
+        u = quote(m["url"], safe="")
         items.append({
+            "type": m["type"],
             "name": name,
-            "preview": f"/api/download?u={quote(v, safe='')}&inline=1",
-            "download": f"/api/download?u={quote(v, safe='')}&name={quote(name)}",
+            "preview": f"/api/download?u={u}&inline=1",
+            "download": f"/api/download?u={u}&name={quote(name)}",
         })
-    return jsonify(videos=items)
+    return jsonify(items=items)
 
 
 @app.get("/api/download")
@@ -86,7 +76,7 @@ def api_download():
     u = request.args.get("u", "")
     if not is_allowed_cdn(u):
         abort(400)
-    name = re.sub(r"[^\w.-]", "_", request.args.get("name", "threads_video.mp4"))
+    name = re.sub(r"[^\w.-]", "_", request.args.get("name", "threads_media"))
 
     fwd = dict(HEADERS)
     if "Range" in request.headers:          # 讓預覽播放器可以拖曳
@@ -115,7 +105,7 @@ INDEX_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Threads 影片下載</title>
+<title>Threads 媒體下載</title>
 <style>
   :root { --bg:#fafafa; --fg:#111; --muted:#777; --card:#fff; --line:#e5e5e5; --accent:#111; --accent-fg:#fff; }
   @media (prefers-color-scheme: dark) {
@@ -137,17 +127,17 @@ INDEX_HTML = """<!doctype html>
   #msg.err { color:#d33; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:16px;
           padding:12px; margin-bottom:16px; }
-  video { width:100%; border-radius:10px; background:#000; max-height:70vh; }
+  video, img.m { width:100%; display:block; object-fit:contain; border-radius:10px; background:#000; max-height:70vh; }
   .row { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:10px; }
   .name { color:var(--muted); font-size:14px; overflow:hidden; text-overflow:ellipsis; }
 </style>
 </head>
 <body>
 <main>
-  <h1>Threads 影片下載</h1>
-  <p class="sub">貼上貼文連結，取得影片並下載。</p>
+  <h1>Threads 媒體下載</h1>
+  <p class="sub">貼上貼文或分享連結（例如 threads.com/share/…），下載影片與圖片。</p>
   <form id="f">
-    <input id="u" type="url" required placeholder="https://www.threads.com/@帳號/post/…">
+    <input id="u" type="text" required autocomplete="off" placeholder="https://www.threads.com/share/…">
     <button id="b">抓取</button>
   </form>
   <div id="msg"></div>
@@ -169,12 +159,15 @@ f.addEventListener('submit', async e => {
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || '發生錯誤');
-    msg.textContent = `找到 ${d.videos.length} 支影片`;
-    for (const v of d.videos) {
+    const nv = d.items.filter(x => x.type === 'video').length, ni = d.items.length - nv;
+    msg.textContent = '找到 ' + [nv && `${nv} 支影片`, ni && `${ni} 張圖片`].filter(Boolean).join('、');
+    for (const v of d.items) {
       const c = document.createElement('div'); c.className = 'card';
-      c.innerHTML = `<video controls playsinline preload="metadata"></video>
-        <div class="row"><span class="name"></span><a class="btn">下載</a></div>`;
-      c.querySelector('video').src = v.preview;
+      const media = v.type === 'video'
+        ? '<video controls playsinline preload="metadata"></video>'
+        : '<img class="m" alt="">';
+      c.innerHTML = media + `<div class="row"><span class="name"></span><a class="btn">下載</a></div>`;
+      c.querySelector('video, img').src = v.preview;
       c.querySelector('.name').textContent = v.name;
       c.querySelector('a').href = v.download;
       out.appendChild(c);

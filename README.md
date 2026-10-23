@@ -1,6 +1,6 @@
-# Threads 影片下載
+# Threads 影片／圖片下載
 
-貼上 Threads 貼文連結，預覽並下載影片。
+貼上 Threads 貼文或分享連結（threads.com/share/…），預覽並下載影片與圖片（含輪播）。
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/pauliu67/threads-downloader)
 
