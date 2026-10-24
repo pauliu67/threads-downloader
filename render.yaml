@@ -1,8 +1,20 @@
 services:
+  # 原本的服務（美國俄勒岡）
   - type: web
     name: threads-downloader
     runtime: docker
     plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: APP_PASSWORD
+        sync: false
+
+  # 新加坡機房：TikTok 對美國主機常不提供亞洲創作者的影片，只給背景音樂
+  - type: web
+    name: threads-downloader-sg
+    runtime: docker
+    plan: free
+    region: singapore
     healthCheckPath: /healthz
     envVars:
       - key: APP_PASSWORD
