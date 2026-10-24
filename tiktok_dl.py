@@ -44,6 +44,8 @@ CACHE_TTL = 15 * 60
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 _locks: dict = {}
+_failures: dict = {}          # video_id -> (時間, 錯誤訊息)；失敗後 5 分鐘內不重抓
+FAIL_TTL = 5 * 60
 _locks_guard = threading.Lock()
 
 
@@ -72,9 +74,18 @@ def _images_from_aweme(aweme: dict):
 def _wrap(orig):
     def parse(self, aweme_detail, *args, **kwargs):
         info = orig(self, aweme_detail, *args, **kwargs)
-        images = _images_from_aweme(aweme_detail or {})
-        if images and isinstance(info, dict):
-            info["tt_images"] = images
+        aweme = aweme_detail or {}
+        images = _images_from_aweme(aweme)
+        if isinstance(info, dict):
+            if images:
+                info["tt_images"] = images
+            # 診斷用：TikTok 回傳的影片資料有哪些欄位
+            v = aweme.get("video") or {}
+            info["tt_diag"] = {
+                "bitrate": len(v.get("bitrateInfo") or v.get("bit_rate") or []),
+                "play": bool(v.get("playAddr") or v.get("play_addr")),
+                "download": bool(v.get("downloadAddr") or v.get("download_addr")),
+            }
         return info
     return parse
 
@@ -112,6 +123,9 @@ def _opts(**extra):
         "no_warnings": True,
         "noplaylist": True,
         "socket_timeout": 20,
+        # 不要預先「試下載」再剔除格式：從雲端主機試常會失敗，導致影片版本全被丟掉。
+        # 改由 _fetch 實際下載並用 ffprobe 檢查。
+        "check_formats": False,
         # 單一檔案（含音訊），優先 H.264 以相容所有手機，並優先無浮水印版本
         "format": "b",
         "format_sort": ["vcodec:h264", "res:1080"],
@@ -127,6 +141,23 @@ def _friendly(err: Exception) -> TikTokError:
     if "blocked" in msg or "403" in msg or "10204" in msg:
         return TikTokError("TikTok 暫時拒絕了伺服器的請求，請稍後再試")
     return TikTokError("無法取得這則 TikTok 貼文（可能已刪除或連結有誤）")
+
+
+def _diag(info: dict, attempts=None) -> str:
+    """把 TikTok 回傳的格式整理成一行，附在錯誤訊息後面方便排查。"""
+    parts = []
+    for f in (info.get("formats") or []):
+        v = f.get("vcodec") or "?"
+        a = "有聲" if f.get("acodec") not in (None, "none") else "無聲"
+        parts.append(f"{f.get('format_id')}({'純音訊' if v == 'none' else v},{a})")
+    d = info.get("tt_diag") or {}
+    s = f"\n［診斷］格式：{'、'.join(parts) or '無'}"
+    if d:
+        s += (f"；bitrateInfo {d.get('bitrate', 0)} 筆、playAddr {'有' if d.get('play') else '無'}、"
+              f"downloadAddr {'有' if d.get('download') else '無'}")
+    if attempts:
+        s += "；嘗試結果：" + "、".join(attempts)
+    return s
 
 
 def _image_ext(u: str) -> str:
@@ -157,9 +188,10 @@ def tiktok_info(url: str) -> dict:
         raise TikTokError("請貼上單一貼文的連結")
 
     images = info.get("tt_images") or []
-    has_video = (info.get("vcodec") or "none") != "none"
+    # 看完整格式清單（不只 yt-dlp 選中的那一個），有任何影片版本就交給下載階段逐一嘗試
+    has_video = any(f.get("vcodec") not in (None, "none") for f in (info.get("formats") or []))
     if not images and not has_video:
-        raise TikTokError("這則貼文只抓得到聲音，沒有影片或圖片")
+        raise TikTokError("這則貼文只抓得到聲音，沒有影片或圖片" + _diag(info))
 
     return {
         "id": str(info["id"]),
@@ -279,7 +311,7 @@ def _download_format(ydl, info: dict, fmt: dict, tmp_dir: str):
     for k in ("requested_formats", "requested_downloads", "format_id", "url", "_filename",
               "filepath"):
         one.pop(k, None)
-    one["formats"] = [fmt]
+    one["formats"] = [{k: v for k, v in fmt.items() if k != "__needs_testing"}]
     ydl.params["format"] = fmt["format_id"]
     ydl.format_selector = ydl.build_format_selector(fmt["format_id"])
     ydl.params["outtmpl"] = {"default": os.path.join(tmp_dir, "media.%(ext)s")}
@@ -301,9 +333,15 @@ def tiktok_file(video_id: str, url: str) -> str:
         path = _cached(video_id)
         if path:
             return path
+        failed = _failures.get(video_id)
+        if failed and time.time() - failed[0] < FAIL_TTL:
+            raise TikTokError(failed[1])
         tmp_dir = tempfile.mkdtemp(dir=CACHE_DIR, prefix=f"dl_{video_id}_")
         try:
             return _fetch(video_id, url, tmp_dir)
+        except TikTokError as e:
+            _failures[video_id] = (time.time(), str(e))
+            raise
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -329,14 +367,20 @@ def _fetch(video_id: str, url: str, tmp_dir: str) -> str:
 
             dst = os.path.join(CACHE_DIR, f"{video_id}.mp4")
             needs_transcode = None            # 有畫面但手機播不了的檔案，最後再轉檔
+            attempts = []
             for fmt in candidates[:6]:
+                fid = fmt.get("format_id")
                 try:
                     src = _download_format(ydl, info, fmt, tmp_dir)
-                except DownloadError:
+                except DownloadError as e:
+                    m = re.search(r"HTTP Error (\d+)", str(e))
+                    attempts.append(f"{fid}:下載失敗{m.group(1) if m else ''}")
                     continue
                 if not src:
+                    attempts.append(f"{fid}:沒有檔案")
                     continue
                 vcodec, _ = _probe(src)
+                attempts.append(f"{fid}:{vcodec or '無畫面'}")
                 if vcodec in ("h264", "unknown"):
                     shutil.move(src, dst)
                     return dst
@@ -351,10 +395,11 @@ def _fetch(video_id: str, url: str, tmp_dir: str) -> str:
             if needs_transcode:
                 if _transcode_to_h264(needs_transcode, dst):
                     return dst
-                raise TikTokError("這支影片使用 TikTok 的 H.266 編碼，伺服器轉檔失敗")
+                raise TikTokError("這支影片使用手機無法播放的編碼，伺服器轉檔失敗"
+                                  + _diag(info, attempts))
+            raise TikTokError("這支影片抓不到畫面" + _diag(info, attempts))
     except DownloadError as e:
         raise _friendly(e) from e
-    raise TikTokError("這支影片抓不到畫面（TikTok 只提供了聲音），請稍後再試")
 
 
 def file_mimetype(path: str) -> str:

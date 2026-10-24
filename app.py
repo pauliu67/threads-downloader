@@ -200,7 +200,7 @@ INDEX_HTML = """<!doctype html>
   button, a.btn { padding:12px 18px; font-size:15px; border:0; border-radius:12px; cursor:pointer;
           background:var(--accent); color:var(--accent-fg); text-decoration:none; white-space:nowrap; }
   button:disabled { opacity:.5; cursor:wait; }
-  #msg { margin:16px 0; color:var(--muted); min-height:1.5em; }
+  #msg { margin:16px 0; color:var(--muted); min-height:1.5em; white-space:pre-line; word-break:break-all; }
   #msg.err { color:#d33; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:16px;
           padding:12px; margin-bottom:16px; }
@@ -250,7 +250,18 @@ f.addEventListener('submit', async e => {
         ? '<audio controls preload="none"></audio>'
         : '<img class="m" alt="" loading="lazy">';
       c.innerHTML = media + `<div class="row"><span class="name"></span><a class="btn">下載</a></div>`;
-      c.querySelector('video, audio, img').src = v.preview;
+      const el = c.querySelector('video, audio, img');
+      el.src = v.preview;
+      // 伺服器下載或轉檔失敗時，把錯誤訊息（含診斷）顯示出來
+      el.addEventListener('error', async () => {
+        try {
+          const r = await fetch(v.preview, {headers: {Range: 'bytes=0-0'}});
+          if (!r.ok) { msg.className = 'err'; msg.textContent = await r.text(); }
+        } catch (_) {}
+      });
+      if (v.type === 'video' && v.preview.startsWith('/api/tiktok')) {
+        msg.textContent += '（TikTok 影片需要伺服器先下載處理，預覽可能要等一下）';
+      }
       if (v.title) {
         const t = document.createElement('p'); t.className = 'title'; t.textContent = v.title;
         c.insertBefore(t, c.querySelector('.row'));
