@@ -3,7 +3,7 @@
 貼上連結，預覽並下載：
 
 - **Threads**：影片與圖片（含輪播），支援 `threads.com/share/…` 分享短連結
-- **TikTok**：影片，支援 `vt.tiktok.com`、`vm.tiktok.com` 分享短連結（使用 yt-dlp；圖片輪播貼文暫不支援）
+- **TikTok**：影片，以及圖片輪播貼文的每張圖片與背景音樂；支援 `vt.tiktok.com`、`vm.tiktok.com` 分享短連結（使用 yt-dlp）
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/pauliu67/threads-downloader)
 

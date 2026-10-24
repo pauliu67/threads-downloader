@@ -16,7 +16,9 @@ import requests
 from flask import Flask, Response, jsonify, request, abort, send_file
 
 from threads_dl import HEADERS, extract, filenames, find_threads_url
-from tiktok_dl import TikTokError, find_tiktok_url, tiktok_file, tiktok_info
+from tiktok_dl import (TikTokError, file_mimetype, find_tiktok_url,
+                       tiktok_file, tiktok_info)
+from tiktok_dl import _image_ext as tiktok_image_ext
 
 app = Flask(__name__)
 
@@ -39,8 +41,11 @@ def require_password():
 def healthz():
     return "ok"
 
-# 只允許代理 Meta 的影片 CDN，避免服務被當成開放代理（SSRF）
-ALLOWED_CDN = re.compile(r"(^|\.)(fbcdn\.net|cdninstagram\.com)$")
+# 只允許代理 Meta／TikTok 的媒體 CDN，避免服務被當成開放代理（SSRF）
+ALLOWED_CDN = re.compile(
+    r"(^|\.)(fbcdn\.net|cdninstagram\.com|"
+    r"tiktokcdn\.com|tiktokcdn-us\.com|tiktokcdn-eu\.com|ibyteimg\.com)$")
+TIKTOK_CDN = re.compile(r"(^|\.)(tiktokcdn(-us|-eu)?\.com|ibyteimg\.com)$")
 
 
 def is_allowed_cdn(u: str) -> bool:
@@ -83,14 +88,42 @@ def extract_tiktok(url: str):
     except TikTokError as e:
         return jsonify(error=str(e)), 404
     vid, src = info["id"], quote(info["url"], safe="")
-    name = f"tiktok_{vid}.mp4"
-    return jsonify(items=[{
-        "type": "video",
-        "name": name,
-        "title": info["title"],
-        "preview": f"/api/tiktok?id={vid}&u={src}&inline=1",
-        "download": f"/api/tiktok?id={vid}&u={src}&name={quote(name)}",
-    }])
+    base = f"tiktok_{vid}"
+
+    if info["kind"] == "video":
+        name = f"{base}.mp4"
+        return jsonify(items=[{
+            "type": "video",
+            "name": name,
+            "title": info["title"],
+            "preview": f"/api/tiktok?id={vid}&u={src}&inline=1",
+            "download": f"/api/tiktok?id={vid}&u={src}&name={quote(name)}",
+        }])
+
+    # 圖片輪播：每張圖片＋背景音樂
+    images = [u for u in info["images"] if is_allowed_cdn(u)]
+    items = []
+    for i, img in enumerate(images, 1):
+        name = f"{base}_{i}{tiktok_image_ext(img)}"
+        u = quote(img, safe="")
+        items.append({
+            "type": "image",
+            "name": name,
+            "preview": f"/api/download?u={u}&inline=1",
+            "download": f"/api/download?u={u}&name={quote(name)}",
+        })
+    if info["has_audio"]:
+        name = f"{base}_music"
+        items.append({
+            "type": "audio",
+            "name": "背景音樂",
+            "preview": f"/api/tiktok?id={vid}&u={src}&inline=1",
+            "download": f"/api/tiktok?id={vid}&u={src}&name={quote(name)}",
+        })
+    if not items:
+        return jsonify(error="找不到這則貼文的圖片"), 404
+    items[0]["title"] = info["title"]
+    return jsonify(items=items)
 
 
 @app.get("/api/tiktok")
@@ -103,9 +136,12 @@ def api_tiktok():
         path = tiktok_file(vid, url)
     except TikTokError as e:
         return Response(str(e), 502, {"Content-Type": "text/plain; charset=utf-8"})
-    name = re.sub(r"[^\w.-]", "_", request.args.get("name", f"tiktok_{vid}.mp4"))
+    name = re.sub(r"[^\w.-]", "_", request.args.get("name", f"tiktok_{vid}"))
+    ext = os.path.splitext(path)[1]
+    if not name.endswith(ext):
+        name += ext
     # send_file 會處理 Range，預覽可以拖曳
-    return send_file(path, mimetype="video/mp4", conditional=True,
+    return send_file(path, mimetype=file_mimetype(path), conditional=True,
                      as_attachment=not request.args.get("inline"),
                      download_name=name)
 
@@ -118,6 +154,8 @@ def api_download():
     name = re.sub(r"[^\w.-]", "_", request.args.get("name", "threads_media"))
 
     fwd = dict(HEADERS)
+    if TIKTOK_CDN.search(urlparse(u).hostname or ""):
+        fwd["Referer"] = "https://www.tiktok.com/"
     if "Range" in request.headers:          # 讓預覽播放器可以拖曳
         fwd["Range"] = request.headers["Range"]
     upstream = requests.get(u, headers=fwd, stream=True, timeout=60)
@@ -166,6 +204,7 @@ INDEX_HTML = """<!doctype html>
   #msg.err { color:#d33; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:16px;
           padding:12px; margin-bottom:16px; }
+  audio { width:100%; display:block; }
   video, img.m { width:100%; display:block; object-fit:contain; border-radius:10px; background:#000; max-height:70vh; }
   .row { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:10px; }
   .title { font-size:14px; margin:10px 0 0; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
@@ -199,15 +238,19 @@ f.addEventListener('submit', async e => {
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || '發生錯誤');
-    const nv = d.items.filter(x => x.type === 'video').length, ni = d.items.length - nv;
-    msg.textContent = '找到 ' + [nv && `${nv} 支影片`, ni && `${ni} 張圖片`].filter(Boolean).join('、');
+    const cnt = t => d.items.filter(x => x.type === t).length;
+    const nv = cnt('video'), ni = cnt('image'), na = cnt('audio');
+    msg.textContent = '找到 ' + [nv && `${nv} 支影片`, ni && `${ni} 張圖片`, na && '背景音樂']
+      .filter(Boolean).join('、');
     for (const v of d.items) {
       const c = document.createElement('div'); c.className = 'card';
       const media = v.type === 'video'
         ? '<video controls playsinline preload="metadata"></video>'
-        : '<img class="m" alt="">';
+        : v.type === 'audio'
+        ? '<audio controls preload="none"></audio>'
+        : '<img class="m" alt="" loading="lazy">';
       c.innerHTML = media + `<div class="row"><span class="name"></span><a class="btn">下載</a></div>`;
-      c.querySelector('video, img').src = v.preview;
+      c.querySelector('video, audio, img').src = v.preview;
       if (v.title) {
         const t = document.createElement('p'); t.className = 'title'; t.textContent = v.title;
         c.insertBefore(t, c.querySelector('.row'));
