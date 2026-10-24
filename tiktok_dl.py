@@ -311,19 +311,43 @@ def _embed_video_urls(video_id: str):
     return sess, urls, notes
 
 
-def _download_with_session(sess, u: str, path: str) -> bool:
+def _download_with_session(sess, u: str, path: str, referer: str):
+    """下載並回傳 (成功與否, 說明)。說明含 HTTP 狀態、類型、大小，方便排查。"""
+    headers = {"Referer": referer, "Origin": "https://www.tiktok.com",
+               "Range": "bytes=0-", "Accept": "*/*"}
     try:
-        r = sess.get(u, headers={"Referer": "https://www.tiktok.com/"},
-                     timeout=120, stream=True)
+        r = sess.get(u, headers=headers, timeout=120, stream=True)
+        ctype = (r.headers.get("content-type") or "?").split(";")[0]
         if r.status_code >= 400:
-            return False
+            return False, f"HTTP{r.status_code}"
         with open(path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 16):
                 if chunk:
                     f.write(chunk)
-        return os.path.getsize(path) > 0
-    except Exception:
-        return False
+        size = os.path.getsize(path)
+        return size > 0, f"HTTP{r.status_code},{ctype},{size // 1024}KB"
+    except Exception as e:
+        return False, f"錯誤{type(e).__name__}"
+
+
+def _streams_summary(path: str) -> str:
+    """列出檔案裡的串流（類型/編碼/標記）；不是影音檔時顯示開頭內容。"""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,codec_name,codec_tag_string", "-of", "json", path],
+            capture_output=True, text=True, timeout=30)
+        streams = json.loads(out.stdout or "{}").get("streams", [])
+        if streams:
+            return "+".join(f"{x.get('codec_type')}/{x.get('codec_name') or '?'}"
+                            f"/{x.get('codec_tag_string') or '?'}" for x in streams)
+        err = (out.stderr or "").strip().splitlines()
+        with open(path, "rb") as f:
+            head = f.read(24)
+        last = err[-1].replace(path, "").strip(": ") if err else ""
+        return f"無串流({last[:60]}) 開頭:{head[:24]!r}"
+    except Exception as e:
+        return f"無法檢查({type(e).__name__})"
 
 
 def _cleanup():
@@ -526,13 +550,19 @@ def _fetch(video_id: str, url: str, tmp_dir: str) -> str:
     # 2) 備援：嵌入播放器頁面
     sess, urls, notes = _embed_video_urls(video_id)
     attempts += notes
+    referers = (f"https://www.tiktok.com/embed/v2/{video_id}", "https://www.tiktok.com/")
     for i, u in enumerate(urls[:4], 1):
-        src = os.path.join(tmp_dir, f"embed_{i}.mp4")
-        if not _download_with_session(sess, u, src):
-            attempts.append(f"嵌入{i}:下載失敗")
-            continue
-        if _accept(src, dst, state, attempts, f"嵌入{i}"):
-            return dst
+        for j, ref in enumerate(referers, 1):
+            label = f"嵌入{i}-{j}"
+            src = os.path.join(tmp_dir, f"embed_{i}_{j}.mp4")
+            ok, how = _download_with_session(sess, u, src, ref)
+            if not ok:
+                attempts.append(f"{label}:下載失敗({how})")
+                continue
+            detail = _streams_summary(src)
+            if _accept(src, dst, state, attempts, label):
+                return dst
+            attempts.append(f"{label}細節:{how};{detail}")
 
     # 3) 只有手機播不了的編碼（例如 H.266）→ 轉成 H.264
     if state.get("transcode"):
