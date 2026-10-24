@@ -70,6 +70,11 @@ def _build_cookiefile():
 
 COOKIEFILE = _build_cookiefile()
 
+# 選用：TikTok 會擋雲端機房的 IP。設定 TIKTOK_PROXY（例如家用網路代理
+# http://帳號:密碼@主機:埠）後，所有連到 TikTok 的請求都改走這個代理。
+PROXY = os.environ.get("TIKTOK_PROXY", "").strip() or None
+PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
+
 _locks: dict = {}
 _failures: dict = {}          # video_id -> (時間, 錯誤訊息)；失敗後 5 分鐘內不重抓
 FAIL_TTL = 5 * 60
@@ -133,7 +138,7 @@ def _resolve(url: str) -> str:
     """展開短連結，並把 /photo/ 換成 yt-dlp 認得的 /video/。"""
     if SHORT_URL_RE.match(url):
         try:
-            r = requests.get(url, headers={"User-Agent": UA}, timeout=15,
+            r = requests.get(url, headers={"User-Agent": UA}, timeout=15, proxies=PROXIES,
                              allow_redirects=True, stream=True)
             r.close()
             if "tiktok.com" in (r.url or ""):
@@ -154,6 +159,7 @@ def _opts(**extra):
         # 改由 _fetch 實際下載並用 ffprobe 檢查。
         "check_formats": False,
         **({"cookiefile": COOKIEFILE} if COOKIEFILE else {}),
+        **({"proxy": PROXY} if PROXY else {}),
         # 單一檔案（含音訊），優先 H.264 以相容所有手機，並優先無浮水印版本
         "format": "b",
         "format_sort": ["vcodec:h264", "res:1080"],
@@ -167,7 +173,8 @@ def _friendly(err: Exception) -> TikTokError:
     if "private" in msg or "permission" in msg or "login" in msg:
         return TikTokError("這則貼文是私人內容或需要登入才能觀看")
     if "blocked" in msg or "403" in msg or "10204" in msg:
-        return TikTokError("TikTok 暫時拒絕了伺服器的請求，請稍後再試")
+        return TikTokError("TikTok 拒絕了伺服器的連線（雲端主機的 IP 被擋）"
+                           + ("" if PROXY else "，可設定 TIKTOK_PROXY 改走一般網路"))
     return TikTokError("無法取得這則 TikTok 貼文（可能已刪除或連結有誤）")
 
 
@@ -190,6 +197,7 @@ def _diag(info: dict, attempts=None) -> str:
     d = info.get("tt_diag") or {}
     s = (f"\n［診斷］{'已' if COOKIEFILE else '未'}登入；"
          f"瀏覽器模擬{'可用' if _can_impersonate() else '不可用'}；"
+         f"{'經由代理' if PROXY else '直連'}；"
          f"格式：{'、'.join(parts) or '無'}")
     if d:
         s += (f"；bitrateInfo {d.get('bitrate', 0)} 筆、playAddr {'有' if d.get('play') else '無'}、"

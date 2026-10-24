@@ -10,6 +10,8 @@ services:
         sync: false
       - key: TIKTOK_SESSIONID
         sync: false
+      - key: TIKTOK_PROXY
+        sync: false
 
   # 新加坡機房：TikTok 對美國主機常不提供亞洲創作者的影片，只給背景音樂
   - type: web
@@ -22,4 +24,6 @@ services:
       - key: APP_PASSWORD
         sync: false
       - key: TIKTOK_SESSIONID
+        sync: false
+      - key: TIKTOK_PROXY
         sync: false

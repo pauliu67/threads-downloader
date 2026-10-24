@@ -19,6 +19,7 @@ from threads_dl import HEADERS, extract, filenames, find_threads_url
 from tiktok_dl import (TikTokError, file_mimetype, find_tiktok_url,
                        tiktok_file, tiktok_info)
 from tiktok_dl import _image_ext as tiktok_image_ext
+from tiktok_dl import PROXIES as TIKTOK_PROXIES
 
 app = Flask(__name__)
 
@@ -158,7 +159,9 @@ def api_download():
         fwd["Referer"] = "https://www.tiktok.com/"
     if "Range" in request.headers:          # 讓預覽播放器可以拖曳
         fwd["Range"] = request.headers["Range"]
-    upstream = requests.get(u, headers=fwd, stream=True, timeout=60)
+    is_tiktok = TIKTOK_CDN.search(urlparse(u).hostname or "")
+    upstream = requests.get(u, headers=fwd, stream=True, timeout=60,
+                            proxies=TIKTOK_PROXIES if is_tiktok else None)
 
     headers = {"Content-Type": upstream.headers.get("Content-Type", "video/mp4"),
                "Accept-Ranges": "bytes"}
