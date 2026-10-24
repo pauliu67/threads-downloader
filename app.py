@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Threads 影片／圖片下載 Web 服務
+Threads／TikTok 影片與圖片下載 Web 服務
 
 啟動：
     pip install -r requirements.txt
@@ -13,9 +13,10 @@ import re
 from urllib.parse import urlparse, quote
 
 import requests
-from flask import Flask, Response, jsonify, request, abort
+from flask import Flask, Response, jsonify, request, abort, send_file
 
 from threads_dl import HEADERS, extract, filenames, find_threads_url
+from tiktok_dl import TikTokError, find_tiktok_url, tiktok_file, tiktok_info
 
 app = Flask(__name__)
 
@@ -31,7 +32,7 @@ def require_password():
     if auth and auth.password == APP_PASSWORD:
         return None
     return Response("需要密碼", 401,
-                    {"WWW-Authenticate": 'Basic realm="Threads Downloader"'})
+                    {"WWW-Authenticate": 'Basic realm="Media Downloader"'})
 
 
 @app.get("/healthz")
@@ -50,9 +51,14 @@ def is_allowed_cdn(u: str) -> bool:
 @app.post("/api/extract")
 def api_extract():
     raw = (request.get_json(silent=True) or {}).get("url", "")
+
+    tt_url = find_tiktok_url(raw)
+    if tt_url:
+        return extract_tiktok(tt_url)
+
     url = find_threads_url(raw)
     if not url:
-        return jsonify(error="找不到 Threads 連結，請貼上貼文或分享連結"), 400
+        return jsonify(error="找不到 Threads 或 TikTok 連結，請貼上貼文或分享連結"), 400
 
     code, media = extract(url)
     media = [m for m in media if is_allowed_cdn(m["url"])]
@@ -69,6 +75,39 @@ def api_extract():
             "download": f"/api/download?u={u}&name={quote(name)}",
         })
     return jsonify(items=items)
+
+
+def extract_tiktok(url: str):
+    try:
+        info = tiktok_info(url)
+    except TikTokError as e:
+        return jsonify(error=str(e)), 404
+    vid, src = info["id"], quote(info["url"], safe="")
+    name = f"tiktok_{vid}.mp4"
+    return jsonify(items=[{
+        "type": "video",
+        "name": name,
+        "title": info["title"],
+        "preview": f"/api/tiktok?id={vid}&u={src}&inline=1",
+        "download": f"/api/tiktok?id={vid}&u={src}&name={quote(name)}",
+    }])
+
+
+@app.get("/api/tiktok")
+def api_tiktok():
+    vid = request.args.get("id", "")
+    url = find_tiktok_url(request.args.get("u", ""))
+    if not url:
+        abort(400)
+    try:
+        path = tiktok_file(vid, url)
+    except TikTokError as e:
+        return Response(str(e), 502, {"Content-Type": "text/plain; charset=utf-8"})
+    name = re.sub(r"[^\w.-]", "_", request.args.get("name", f"tiktok_{vid}.mp4"))
+    # send_file 會處理 Range，預覽可以拖曳
+    return send_file(path, mimetype="video/mp4", conditional=True,
+                     as_attachment=not request.args.get("inline"),
+                     download_name=name)
 
 
 @app.get("/api/download")
@@ -105,7 +144,7 @@ INDEX_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Threads 媒體下載</title>
+<title>Threads／TikTok 下載</title>
 <style>
   :root { --bg:#fafafa; --fg:#111; --muted:#777; --card:#fff; --line:#e5e5e5; --accent:#111; --accent-fg:#fff; }
   @media (prefers-color-scheme: dark) {
@@ -129,15 +168,16 @@ INDEX_HTML = """<!doctype html>
           padding:12px; margin-bottom:16px; }
   video, img.m { width:100%; display:block; object-fit:contain; border-radius:10px; background:#000; max-height:70vh; }
   .row { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:10px; }
+  .title { font-size:14px; margin:10px 0 0; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
   .name { color:var(--muted); font-size:14px; overflow:hidden; text-overflow:ellipsis; }
 </style>
 </head>
 <body>
 <main>
-  <h1>Threads 媒體下載</h1>
-  <p class="sub">貼上貼文或分享連結（例如 threads.com/share/…），下載影片與圖片。</p>
+  <h1>Threads／TikTok 下載</h1>
+  <p class="sub">貼上 Threads 或 TikTok 的貼文／分享連結，下載影片與圖片。</p>
   <form id="f">
-    <input id="u" type="text" required autocomplete="off" placeholder="https://www.threads.com/share/…">
+    <input id="u" type="text" required autocomplete="off" placeholder="貼上 Threads 或 TikTok 連結">
     <button id="b">抓取</button>
   </form>
   <div id="msg"></div>
@@ -168,6 +208,10 @@ f.addEventListener('submit', async e => {
         : '<img class="m" alt="">';
       c.innerHTML = media + `<div class="row"><span class="name"></span><a class="btn">下載</a></div>`;
       c.querySelector('video, img').src = v.preview;
+      if (v.title) {
+        const t = document.createElement('p'); t.className = 'title'; t.textContent = v.title;
+        c.insertBefore(t, c.querySelector('.row'));
+      }
       c.querySelector('.name').textContent = v.name;
       c.querySelector('a').href = v.download;
       out.appendChild(c);
