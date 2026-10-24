@@ -279,6 +279,8 @@ def _looks_like_video(u: str) -> bool:
     if not _VIDEO_HOST.search(urlparse(u).hostname or ""):
         return False
     low = u.lower()
+    if any(k in low for k in ("mime_type=audio", ".mp3", "/music/", "audio_mpeg", "ies-music")):
+        return False                       # 背景音樂，不是影片
     return any(k in low for k in ("mime_type=video", "/video/tos/", "video_mp4"))
 
 
