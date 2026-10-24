@@ -43,6 +43,33 @@ CACHE_DIR = os.path.join(tempfile.gettempdir(), "tiktok_cache")
 CACHE_TTL = 15 * 60
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+def _build_cookiefile():
+    """
+    選用：讓伺服器以 TikTok 帳號的登入狀態抓取（需要登入或有年齡限制的影片）。
+      TIKTOK_COOKIES   ：Netscape 格式的完整 cookies.txt 內容
+      TIKTOK_SESSIONID ：只填瀏覽器 cookie 裡的 sessionid 值
+    建議使用研究專用的帳號，不要用個人主帳號。
+    """
+    raw = os.environ.get("TIKTOK_COOKIES", "").strip()
+    sid = os.environ.get("TIKTOK_SESSIONID", "").strip()
+    if not raw and not sid:
+        return None
+    if not raw:
+        exp = int(time.time()) + 365 * 86400
+        raw = "\n".join(
+            f".tiktok.com\tTRUE\t/\tTRUE\t{exp}\t{name}\t{sid}"
+            for name in ("sessionid", "sessionid_ss", "sid_tt"))
+    if not raw.startswith("# Netscape"):
+        raw = "# Netscape HTTP Cookie File\n" + raw
+    path = os.path.join(tempfile.gettempdir(), "tiktok_cookies.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(raw + "\n")
+    os.chmod(path, 0o600)
+    return path
+
+
+COOKIEFILE = _build_cookiefile()
+
 _locks: dict = {}
 _failures: dict = {}          # video_id -> (時間, 錯誤訊息)；失敗後 5 分鐘內不重抓
 FAIL_TTL = 5 * 60
@@ -126,6 +153,7 @@ def _opts(**extra):
         # 不要預先「試下載」再剔除格式：從雲端主機試常會失敗，導致影片版本全被丟掉。
         # 改由 _fetch 實際下載並用 ffprobe 檢查。
         "check_formats": False,
+        **({"cookiefile": COOKIEFILE} if COOKIEFILE else {}),
         # 單一檔案（含音訊），優先 H.264 以相容所有手機，並優先無浮水印版本
         "format": "b",
         "format_sort": ["vcodec:h264", "res:1080"],
@@ -151,7 +179,7 @@ def _diag(info: dict, attempts=None) -> str:
         a = "有聲" if f.get("acodec") not in (None, "none") else "無聲"
         parts.append(f"{f.get('format_id')}({'純音訊' if v == 'none' else v},{a})")
     d = info.get("tt_diag") or {}
-    s = f"\n［診斷］格式：{'、'.join(parts) or '無'}"
+    s = f"\n［診斷］{'已' if COOKIEFILE else '未'}登入；格式：{'、'.join(parts) or '無'}"
     if d:
         s += (f"；bitrateInfo {d.get('bitrate', 0)} 筆、playAddr {'有' if d.get('play') else '無'}、"
               f"downloadAddr {'有' if d.get('download') else '無'}")
@@ -191,7 +219,9 @@ def tiktok_info(url: str) -> dict:
     # 看完整格式清單（不只 yt-dlp 選中的那一個），有任何影片版本就交給下載階段逐一嘗試
     has_video = any(f.get("vcodec") not in (None, "none") for f in (info.get("formats") or []))
     if not images and not has_video:
-        raise TikTokError("這則貼文只抓得到聲音，沒有影片或圖片" + _diag(info))
+        hint = ("" if COOKIEFILE else
+                "\n這類影片通常需要登入才能看（例如年齡限制），可在伺服器設定 TIKTOK_SESSIONID。")
+        raise TikTokError("這則貼文只抓得到聲音，沒有影片或圖片" + hint + _diag(info))
 
     return {
         "id": str(info["id"]),
