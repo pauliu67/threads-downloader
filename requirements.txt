@@ -3,3 +3,4 @@ requests>=2.31
 playwright>=1.45
 gunicorn>=22.0
 yt-dlp
+curl_cffi

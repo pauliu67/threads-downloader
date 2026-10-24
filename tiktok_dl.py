@@ -171,6 +171,15 @@ def _friendly(err: Exception) -> TikTokError:
     return TikTokError("無法取得這則 TikTok 貼文（可能已刪除或連結有誤）")
 
 
+def _can_impersonate() -> bool:
+    """yt-dlp 是否能模擬真實瀏覽器連線（需要 curl_cffi）；TikTok 沒有它常只回傳簡化資料。"""
+    try:
+        with YoutubeDL({"quiet": True}) as ydl:
+            return bool(ydl._get_available_impersonate_targets())
+    except Exception:
+        return False
+
+
 def _diag(info: dict, attempts=None) -> str:
     """把 TikTok 回傳的格式整理成一行，附在錯誤訊息後面方便排查。"""
     parts = []
@@ -179,7 +188,9 @@ def _diag(info: dict, attempts=None) -> str:
         a = "有聲" if f.get("acodec") not in (None, "none") else "無聲"
         parts.append(f"{f.get('format_id')}({'純音訊' if v == 'none' else v},{a})")
     d = info.get("tt_diag") or {}
-    s = f"\n［診斷］{'已' if COOKIEFILE else '未'}登入；格式：{'、'.join(parts) or '無'}"
+    s = (f"\n［診斷］{'已' if COOKIEFILE else '未'}登入；"
+         f"瀏覽器模擬{'可用' if _can_impersonate() else '不可用'}；"
+         f"格式：{'、'.join(parts) or '無'}")
     if d:
         s += (f"；bitrateInfo {d.get('bitrate', 0)} 筆、playAddr {'有' if d.get('play') else '無'}、"
               f"downloadAddr {'有' if d.get('download') else '無'}")
