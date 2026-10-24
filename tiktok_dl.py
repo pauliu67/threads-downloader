@@ -26,6 +26,7 @@ import threading
 import time
 
 import requests
+from urllib.parse import urlparse
 from yt_dlp import YoutubeDL
 from yt_dlp.extractor.tiktok import TikTokBaseIE
 from yt_dlp.utils import DownloadError
@@ -237,10 +238,15 @@ def tiktok_info(url: str) -> dict:
     images = info.get("tt_images") or []
     # 看完整格式清單（不只 yt-dlp 選中的那一個），有任何影片版本就交給下載階段逐一嘗試
     has_video = any(f.get("vcodec") not in (None, "none") for f in (info.get("formats") or []))
+    embed_notes = []
+    if not images and not has_video:
+        _, embed_urls, embed_notes = _embed_video_urls(str(info["id"]))
+        has_video = bool(embed_urls)
     if not images and not has_video:
         hint = ("" if COOKIEFILE else
                 "\n這類影片通常需要登入才能看（例如年齡限制），可在伺服器設定 TIKTOK_SESSIONID。")
-        raise TikTokError("這則貼文只抓得到聲音，沒有影片或圖片" + hint + _diag(info))
+        raise TikTokError("這則貼文只抓得到聲音，沒有影片或圖片" + hint
+                          + _diag(info, embed_notes))
 
     return {
         "id": str(info["id"]),
@@ -250,6 +256,74 @@ def tiktok_info(url: str) -> dict:
         "images": images,
         "has_audio": (info.get("acodec") or "none") != "none",
     }
+
+
+# ---------- 備援：TikTok 嵌入播放器頁面 ----------
+# 一般網頁對未登入訪客有時只給背景音樂；嵌入播放器（網站嵌入 TikTok 影片用的頁面）
+# 提供資料的方式不同，常常仍有影片網址。
+
+EMBED_PAGES = (("player", "https://www.tiktok.com/player/v1/{id}"),
+               ("embed", "https://www.tiktok.com/embed/v2/{id}"))
+_URL_IN_JSON = re.compile(r'"(https?:(?:\\/|\\u002[Ff]|/)[^"\s]+)"')
+_VIDEO_HOST = re.compile(r"tiktok|byteoversea|ibyteimg|ibytedtos|muscdn", re.I)
+
+
+def _unescape(u: str) -> str:
+    try:
+        return json.loads(f'"{u}"')
+    except ValueError:
+        return u.replace("\\/", "/").replace("\\u002F", "/").replace("\\u0026", "&")
+
+
+def _looks_like_video(u: str) -> bool:
+    if not _VIDEO_HOST.search(urlparse(u).hostname or ""):
+        return False
+    low = u.lower()
+    return any(k in low for k in ("mime_type=video", "/video/tos/", "video_mp4"))
+
+
+def _embed_session():
+    from curl_cffi import requests as creq        # yt-dlp 瀏覽器模擬用的同一個套件
+    return creq.Session(impersonate="chrome", proxies=PROXIES)
+
+
+def _embed_video_urls(video_id: str):
+    """回傳 (session, 影片網址清單, 診斷說明)。"""
+    notes, urls = [], []
+    try:
+        sess = _embed_session()
+    except Exception:
+        return None, [], ["嵌入頁:無法建立連線"]
+    for name, tpl in EMBED_PAGES:
+        try:
+            r = sess.get(tpl.format(id=video_id), timeout=20)
+        except Exception:
+            notes.append(f"{name}:連線失敗")
+            continue
+        found = [_unescape(m.group(1)) for m in _URL_IN_JSON.finditer(r.text or "")]
+        vids = [u for u in found if _looks_like_video(u)]
+        notes.append(f"{name}:HTTP{r.status_code},影片網址{len(vids)}個")
+        for u in vids:
+            if u not in urls:
+                urls.append(u)
+        if urls:
+            break
+    return sess, urls, notes
+
+
+def _download_with_session(sess, u: str, path: str) -> bool:
+    try:
+        r = sess.get(u, headers={"Referer": "https://www.tiktok.com/"},
+                     timeout=120, stream=True)
+        if r.status_code >= 400:
+            return False
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 16):
+                if chunk:
+                    f.write(chunk)
+        return os.path.getsize(path) > 0
+    except Exception:
+        return False
 
 
 def _cleanup():
@@ -395,14 +469,32 @@ def tiktok_file(video_id: str, url: str) -> str:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def _accept(src: str, dst: str, state: dict, attempts: list, label: str) -> bool:
+    """檢查下載的檔案；可直接用或已重新封裝就回傳 True，需轉檔的先留著。"""
+    vcodec, _ = _probe(src)
+    attempts.append(f"{label}:{vcodec or '無畫面'}")
+    if vcodec in ("h264", "unknown"):
+        shutil.move(src, dst)
+        return True
+    if vcodec == "hevc" and _remux_for_iphone(src, dst):
+        return True
+    if vcodec and state.get("transcode") is None:
+        keep = os.path.join(os.path.dirname(src), "transcode_src" + os.path.splitext(src)[1])
+        shutil.move(src, keep)
+        state["transcode"] = keep
+    return False
+
+
 def _fetch(video_id: str, url: str, tmp_dir: str) -> str:
+    dst = os.path.join(CACHE_DIR, f"{video_id}.mp4")
+    state, attempts = {}, []
     try:
         with YoutubeDL(_opts()) as ydl:
             info = ydl.extract_info(_resolve(url), download=False)
             candidates = _candidate_formats(info)
 
             # 圖片輪播：沒有影片格式，只下載背景音樂
-            if not candidates:
+            if not candidates and info.get("tt_images"):
                 audio = [f for f in (info.get("formats") or [])
                          if f.get("url") and f.get("acodec") not in (None, "none")]
                 if not audio:
@@ -410,13 +502,11 @@ def _fetch(video_id: str, url: str, tmp_dir: str) -> str:
                 src = _download_format(ydl, info, audio[-1], tmp_dir)
                 if not src:
                     raise TikTokError("下載失敗，請再試一次")
-                dst = os.path.join(CACHE_DIR, f"{video_id}{os.path.splitext(src)[1]}")
-                shutil.move(src, dst)
-                return dst
+                adst = os.path.join(CACHE_DIR, f"{video_id}{os.path.splitext(src)[1]}")
+                shutil.move(src, adst)
+                return adst
 
-            dst = os.path.join(CACHE_DIR, f"{video_id}.mp4")
-            needs_transcode = None            # 有畫面但手機播不了的檔案，最後再轉檔
-            attempts = []
+            # 1) yt-dlp 從一般網頁取得的格式
             for fmt in candidates[:6]:
                 fid = fmt.get("format_id")
                 try:
@@ -428,27 +518,29 @@ def _fetch(video_id: str, url: str, tmp_dir: str) -> str:
                 if not src:
                     attempts.append(f"{fid}:沒有檔案")
                     continue
-                vcodec, _ = _probe(src)
-                attempts.append(f"{fid}:{vcodec or '無畫面'}")
-                if vcodec in ("h264", "unknown"):
-                    shutil.move(src, dst)
+                if _accept(src, dst, state, attempts, fid):
                     return dst
-                if vcodec == "hevc" and _remux_for_iphone(src, dst):
-                    return dst
-                if vcodec and needs_transcode is None:
-                    keep = os.path.join(tmp_dir, "transcode_src" + os.path.splitext(src)[1])
-                    shutil.move(src, keep)
-                    needs_transcode = keep
-                # 沒有畫面，或是手機播不了的編碼（例如 H.266）→ 先試下一個格式
-
-            if needs_transcode:
-                if _transcode_to_h264(needs_transcode, dst):
-                    return dst
-                raise TikTokError("這支影片使用手機無法播放的編碼，伺服器轉檔失敗"
-                                  + _diag(info, attempts))
-            raise TikTokError("這支影片抓不到畫面" + _diag(info, attempts))
     except DownloadError as e:
         raise _friendly(e) from e
+
+    # 2) 備援：嵌入播放器頁面
+    sess, urls, notes = _embed_video_urls(video_id)
+    attempts += notes
+    for i, u in enumerate(urls[:4], 1):
+        src = os.path.join(tmp_dir, f"embed_{i}.mp4")
+        if not _download_with_session(sess, u, src):
+            attempts.append(f"嵌入{i}:下載失敗")
+            continue
+        if _accept(src, dst, state, attempts, f"嵌入{i}"):
+            return dst
+
+    # 3) 只有手機播不了的編碼（例如 H.266）→ 轉成 H.264
+    if state.get("transcode"):
+        if _transcode_to_h264(state["transcode"], dst):
+            return dst
+        raise TikTokError("這支影片使用手機無法播放的編碼，伺服器轉檔失敗"
+                          + _diag(info, attempts))
+    raise TikTokError("這支影片抓不到畫面" + _diag(info, attempts))
 
 
 def file_mimetype(path: str) -> str:
