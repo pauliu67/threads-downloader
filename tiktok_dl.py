@@ -13,10 +13,14 @@ TikTok 影片／圖片輪播下載（以 yt-dlp 處理）
 圖片輪播：yt-dlp 只會回傳背景音樂，這裡另外從貼文資料取出每張圖片的網址，音樂也一併提供。
 """
 
+import copy
 import glob
+import json
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -104,6 +108,7 @@ def _resolve(url: str) -> str:
 def _opts(**extra):
     opts = {
         "quiet": True,
+        "noprogress": True,
         "no_warnings": True,
         "noplaylist": True,
         "socket_timeout": 20,
@@ -171,16 +176,93 @@ def _cleanup():
     for f in glob.glob(os.path.join(CACHE_DIR, "*")):
         try:
             if now - os.path.getmtime(f) > CACHE_TTL:
-                os.remove(f)
+                if os.path.isdir(f):
+                    shutil.rmtree(f, ignore_errors=True)
+                else:
+                    os.remove(f)
         except OSError:
             pass
 
 
 def _cached(video_id: str):
     for f in glob.glob(os.path.join(CACHE_DIR, f"{video_id}.*")):
-        if not f.endswith((".part", ".ytdl", ".tmp")):
+        if os.path.isfile(f) and not f.endswith((".part", ".ytdl", ".tmp")):
             return f
     return None
+
+
+def _probe(path: str):
+    """回傳 (影片編碼, 音訊編碼)，沒有則為 None。"""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=30).stdout
+        streams = json.loads(out or "{}").get("streams", [])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return "unknown", "unknown"          # 沒有 ffprobe 時不做檢查
+    v = next((s.get("codec_name") for s in streams if s.get("codec_type") == "video"), None)
+    a = next((s.get("codec_name") for s in streams if s.get("codec_type") == "audio"), None)
+    return v, a
+
+
+def _remux_for_iphone(src: str, dst: str) -> bool:
+    """HEVC 重新封裝成 hvc1 標記（iPhone／Safari 才能顯示畫面），並把索引移到檔頭方便預覽。"""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", src, "-c", "copy", "-tag:v", "hvc1",
+             "-movflags", "+faststart", dst],
+            capture_output=True, timeout=120)
+        return r.returncode == 0 and os.path.getsize(dst) > 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _candidate_formats(info: dict):
+    """
+    依「最可能在手機上正常播放」排序候選格式：
+    明確標示為 H.264 的 > H.265 > 未標示編碼的 play > 有浮水印的 download（通常是 H.264）
+    排除只有聲音、只有畫面，以及 TikTok 自家 H.266（bytevc2）格式。
+    """
+    fmts = [f for f in (info.get("formats") or [])
+            if f.get("url") and f.get("vcodec") not in (None, "none")
+            and f.get("acodec") not in (None, "none")
+            and f.get("vcodec") != "bytevc2" and f.get("format_note") != "UNPLAYABLE"]
+
+    def rank(f):
+        fid, vc = f.get("format_id") or "", f.get("vcodec") or ""
+        if fid == "download":
+            group = 3
+        elif fid == "play":
+            group = 2
+        elif vc.startswith(("h264", "avc")):
+            group = 0
+        elif vc.startswith(("h265", "hevc", "hvc", "bytevc1")):
+            group = 1
+        else:
+            group = 2
+        size = (f.get("width") or 0) * (f.get("height") or 0)
+        return (group, -size, -(f.get("tbr") or 0))
+
+    return sorted(fmts, key=rank)
+
+
+def _download_format(ydl, info: dict, fmt: dict, tmp_dir: str):
+    """用同一個 YoutubeDL（保留 cookie）下載指定格式，回傳檔案路徑。"""
+    for f in glob.glob(os.path.join(tmp_dir, "*")):
+        os.remove(f)
+    one = copy.deepcopy(info)
+    for k in ("requested_formats", "requested_downloads", "format_id", "url", "_filename",
+              "filepath"):
+        one.pop(k, None)
+    one["formats"] = [fmt]
+    ydl.params["format"] = fmt["format_id"]
+    ydl.format_selector = ydl.build_format_selector(fmt["format_id"])
+    ydl.params["outtmpl"] = {"default": os.path.join(tmp_dir, "media.%(ext)s")}
+    ydl.process_ie_result(one, download=True)
+    files = [f for f in glob.glob(os.path.join(tmp_dir, "media.*"))
+             if not f.endswith((".part", ".ytdl"))]
+    return files[0] if files else None
 
 
 def tiktok_file(video_id: str, url: str) -> str:
@@ -195,15 +277,50 @@ def tiktok_file(video_id: str, url: str) -> str:
         path = _cached(video_id)
         if path:
             return path
+        tmp_dir = tempfile.mkdtemp(dir=CACHE_DIR, prefix=f"dl_{video_id}_")
         try:
-            with YoutubeDL(_opts(outtmpl=os.path.join(CACHE_DIR, "%(id)s.%(ext)s"))) as ydl:
-                ydl.download([_resolve(url)])
-        except DownloadError as e:
-            raise _friendly(e) from e
-        path = _cached(video_id)
-        if not path:
-            raise TikTokError("下載失敗，請再試一次")
-        return path
+            return _fetch(video_id, url, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _fetch(video_id: str, url: str, tmp_dir: str) -> str:
+    try:
+        with YoutubeDL(_opts()) as ydl:
+            info = ydl.extract_info(_resolve(url), download=False)
+            candidates = _candidate_formats(info)
+
+            # 圖片輪播：沒有影片格式，只下載背景音樂
+            if not candidates:
+                audio = [f for f in (info.get("formats") or [])
+                         if f.get("url") and f.get("acodec") not in (None, "none")]
+                if not audio:
+                    raise TikTokError("這則貼文沒有可下載的影片或聲音")
+                src = _download_format(ydl, info, audio[-1], tmp_dir)
+                if not src:
+                    raise TikTokError("下載失敗，請再試一次")
+                dst = os.path.join(CACHE_DIR, f"{video_id}{os.path.splitext(src)[1]}")
+                shutil.move(src, dst)
+                return dst
+
+            for fmt in candidates[:5]:
+                try:
+                    src = _download_format(ydl, info, fmt, tmp_dir)
+                except DownloadError:
+                    continue
+                if not src:
+                    continue
+                vcodec, _ = _probe(src)
+                dst = os.path.join(CACHE_DIR, f"{video_id}.mp4")
+                if vcodec in ("h264", "unknown"):
+                    shutil.move(src, dst)
+                    return dst
+                if vcodec == "hevc" and _remux_for_iphone(src, dst):
+                    return dst
+                # 沒有畫面，或是手機播不了的編碼（例如 H.266）→ 換下一個格式
+    except DownloadError as e:
+        raise _friendly(e) from e
+    raise TikTokError("TikTok 只提供了手機無法播放的影片格式，請稍後再試")
 
 
 def file_mimetype(path: str) -> str:
