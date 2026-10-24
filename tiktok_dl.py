@@ -201,9 +201,30 @@ def _probe(path: str):
         streams = json.loads(out or "{}").get("streams", [])
     except (OSError, subprocess.SubprocessError, ValueError):
         return "unknown", "unknown"          # 沒有 ffprobe 時不做檢查
-    v = next((s.get("codec_name") for s in streams if s.get("codec_type") == "video"), None)
-    a = next((s.get("codec_name") for s in streams if s.get("codec_type") == "audio"), None)
+    # 有影片串流但 ffprobe 認不出編碼時回傳 "unrecognized"，與「沒有畫面」(None) 區分
+    v = next((s.get("codec_name") or "unrecognized"
+              for s in streams if s.get("codec_type") == "video"), None)
+    a = next((s.get("codec_name") or "unrecognized"
+              for s in streams if s.get("codec_type") == "audio"), None)
     return v, a
+
+
+def _transcode_to_h264(src: str, dst: str) -> bool:
+    """
+    把手機無法播放的編碼（例如 TikTok 的 H.266／bytevc2）轉成 H.264。
+    需要支援 VVC 解碼的 ffmpeg（7.0 以上）；為了在小主機上跑得動，限制寬度 720 並使用快速設定。
+    """
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", src,
+             "-map", "0:v:0", "-map", "0:a:0?",
+             "-vf", "scale='min(720,iw)':-2", "-c:v", "libx264", "-preset", "veryfast",
+             "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+             "-movflags", "+faststart", dst],
+            capture_output=True, timeout=900)
+        return r.returncode == 0 and os.path.getsize(dst) > 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _remux_for_iphone(src: str, dst: str) -> bool:
@@ -222,16 +243,19 @@ def _candidate_formats(info: dict):
     """
     依「最可能在手機上正常播放」排序候選格式：
     明確標示為 H.264 的 > H.265 > 未標示編碼的 play > 有浮水印的 download（通常是 H.264）
-    排除只有聲音、只有畫面，以及 TikTok 自家 H.266（bytevc2）格式。
+    > TikTok 自家 H.266（bytevc2，需轉檔，最後才用）。
+    排除只有聲音或只有畫面的格式。
+    關閉下載的影片通常沒有 download 版本，只剩播放用的 H.265／H.266 串流。
     """
     fmts = [f for f in (info.get("formats") or [])
             if f.get("url") and f.get("vcodec") not in (None, "none")
-            and f.get("acodec") not in (None, "none")
-            and f.get("vcodec") != "bytevc2" and f.get("format_note") != "UNPLAYABLE"]
+            and f.get("acodec") not in (None, "none")]
 
     def rank(f):
         fid, vc = f.get("format_id") or "", f.get("vcodec") or ""
-        if fid == "download":
+        if vc == "bytevc2" or f.get("format_note") == "UNPLAYABLE":
+            group = 4
+        elif fid == "download":
             group = 3
         elif fid == "play":
             group = 2
@@ -303,7 +327,9 @@ def _fetch(video_id: str, url: str, tmp_dir: str) -> str:
                 shutil.move(src, dst)
                 return dst
 
-            for fmt in candidates[:5]:
+            dst = os.path.join(CACHE_DIR, f"{video_id}.mp4")
+            needs_transcode = None            # 有畫面但手機播不了的檔案，最後再轉檔
+            for fmt in candidates[:6]:
                 try:
                     src = _download_format(ydl, info, fmt, tmp_dir)
                 except DownloadError:
@@ -311,16 +337,24 @@ def _fetch(video_id: str, url: str, tmp_dir: str) -> str:
                 if not src:
                     continue
                 vcodec, _ = _probe(src)
-                dst = os.path.join(CACHE_DIR, f"{video_id}.mp4")
                 if vcodec in ("h264", "unknown"):
                     shutil.move(src, dst)
                     return dst
                 if vcodec == "hevc" and _remux_for_iphone(src, dst):
                     return dst
-                # 沒有畫面，或是手機播不了的編碼（例如 H.266）→ 換下一個格式
+                if vcodec and needs_transcode is None:
+                    keep = os.path.join(tmp_dir, "transcode_src" + os.path.splitext(src)[1])
+                    shutil.move(src, keep)
+                    needs_transcode = keep
+                # 沒有畫面，或是手機播不了的編碼（例如 H.266）→ 先試下一個格式
+
+            if needs_transcode:
+                if _transcode_to_h264(needs_transcode, dst):
+                    return dst
+                raise TikTokError("這支影片使用 TikTok 的 H.266 編碼，伺服器轉檔失敗")
     except DownloadError as e:
         raise _friendly(e) from e
-    raise TikTokError("TikTok 只提供了手機無法播放的影片格式，請稍後再試")
+    raise TikTokError("這支影片抓不到畫面（TikTok 只提供了聲音），請稍後再試")
 
 
 def file_mimetype(path: str) -> str:
